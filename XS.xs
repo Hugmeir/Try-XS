@@ -86,7 +86,7 @@ S_parse_try(pTHX_ GV* namegv, SV* psobj, U32* flagsp) {
 }
 
 #ifdef XopENTRY_set
-static XOP my_xop;
+static XOP try_op, catch_op, finally_op;
 #endif
 
 MODULE = Try::XS		PACKAGE = Try::XS		
@@ -99,19 +99,40 @@ PROTOTYPE: &;@
 PPCODE:
     croak("Don't do that.");
 
+void
+catch(block, ...)
+PROTOTYPE: &;@
+PPCODE:
+    croak("Don't do that.");
+
+
 BOOT:
 {
     CV * const try     = get_cvn_flags("Try::XS::try", 12, 0);
-    /*
     CV * const catch   = get_cvn_flags("Try::XS::catch", 14, 0);
-    CV * const finally = get_cvn_flags("Try::XS::finally", 16, 0);
-*/
+    //CV * const finally = get_cvn_flags("Try::XS::finally", 16, 0);
+
     cv_set_call_checker(try, S_ck_try, &PL_sv_undef);
     cv_set_call_parser(try, S_parse_try, &PL_sv_undef);
+
+    cv_set_call_checker(catch, S_ck_catch, &PL_sv_undef);
+    cv_set_call_parser(catch, S_parse_catch, &PL_sv_undef);
+
+
 #ifdef XopENTRY_set
-    XopENTRY_set(&my_xop, xop_name, "try");
-    XopENTRY_set(&my_xop, xop_desc, "try");
-    XopENTRY_set(&my_xop, xop_class, OA_UNOP);
-    Perl_custom_op_register(aTHX_ S_pp_try, &my_xop);
+    XopENTRY_set(&try_op, xop_name, "try");
+    XopENTRY_set(&try_op, xop_desc, "try");
+    XopENTRY_set(&try_op, xop_class, OA_UNOP);
+    Perl_custom_op_register(aTHX_ S_pp_try, &try_op);
+
+    XopENTRY_set(&catch_op, xop_name, "catch");
+    XopENTRY_set(&catch_op, xop_desc, "catch");
+    XopENTRY_set(&catch_op, xop_class, OA_UNOP);
+    Perl_custom_op_register(aTHX_ S_pp_catch, &catch_op);
+
+/*    XopENTRY_set(&try_op, xop_name, "try");
+    XopENTRY_set(&try_op, xop_desc, "try");
+    XopENTRY_set(&try_op, xop_class, OA_UNOP);
+    Perl_custom_op_register(aTHX_ S_pp_try, &try_op);*/
 #endif /* XopENTRY_set */
 }
