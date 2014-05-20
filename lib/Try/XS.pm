@@ -9,7 +9,7 @@ use Devel::CallParser;
 use Exporter;
 BEGIN {
     our @ISA    = 'Exporter';
-    our @EXPORT = qw/try/;
+    our @EXPORT = qw/try catch/;
 }
 
 =head1 NAME
