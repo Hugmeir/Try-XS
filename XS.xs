@@ -40,48 +40,43 @@ STATIC OP*
 S_pp_catch(pTHX)
 {
     dVAR;
-    sv_setsv(GvSV(PL_defgv), GvSV(PL_errgv));
-    FREETMPS;
-    LEAVE;
-    sv_setsv(GvSV(PL_errgv)mGvSV(PL_defgv), );
-    return cLOGOP->op_next;
+    sv_setsv(GvSVn(PL_defgv), GvSVn(PL_errgv));
+    return cLOGOP->op_other;
 }
 
 STATIC OP*
 S_pp_entertry(pTHX)
 {
-    OP * try = PL_op;
-    ENTER;
-    SAVETMPS;
-    SAVEGENERICSV(GvSV(PL_errgv));
-
     OP * op = PL_ppaddr[OP_ENTERTRY](aTHX);
     PL_op = op;
     while ((PL_op = op = op->op_ppaddr(aTHX))) {
         if (op->op_ppaddr == S_pp_catch) {
-            sv_dump(GvSV(PL_errgv));
-            op = cLOGOP->op_other;
+            op = cLOGOP->op_next;
             break;
         }
     }
-    FREETMPS;
-    LEAVE;
     return op;
+}
+
+STATIC OP*
+S_pp_tryscope(pTHX)
+{
+    OP *next = PL_ppaddr[OP_ENTER](aTHX);
+    save_gp(PL_errgv, 0);
+    GvINTRO_off(PL_errgv);
+    SAVEGENERICSV(GvSV(PL_errgv));
+    GvSV(PL_errgv) = NULL;
+    return next;
 }
 
 static OP *
 S_ck_try(pTHX_ OP *entersubop, GV *namegv, SV *cv)
 {
     OP * leavetry = remove_sub_call(entersubop);
-    OP * entertry = cUNOPx(leavetry)->op_first;
-    OP * catch    = leavetry->op_sibling;
       
     PERL_UNUSED_ARG(namegv);
     PERL_UNUSED_ARG(cv);      
       
-    entertry->op_type   = OP_CUSTOM;
-    entertry->op_ppaddr = S_pp_entertry;
-
     return leavetry;
 }
 
@@ -100,22 +95,41 @@ S_parse_try(pTHX_ GV* namegv, SV* psobj, U32* flagsp) {
        croak("Couldn't parse the try {} block");
    
     evalop = newUNOP(OP_ENTERTRY, 0, blockop);
+    OP *entertry = cUNOPx(evalop)->op_first;
    
-    /* XXX ffs broken */
-    rest = parse_args_list(flagsp);
-    if (rest) {
-        if ( rest->op_type != OP_LIST )
-            rest = newLISTOP(OP_LIST, 0, rest, NULL);
-        OP* p = cUNOPx(rest)->op_first;
-    
-        evalop->op_sibling = p->op_sibling;
-        p->op_sibling = evalop;
-    }
-    else {
-        rest = evalop;
-    }
+    entertry->op_type   = OP_CUSTOM;
+    entertry->op_ppaddr = S_pp_entertry;
 
-    return rest;
+    rest = parse_args_list(flagsp);
+   
+   LOGOP *logop;
+    NewOp(1101, logop, 1, LOGOP);
+
+    logop->op_type = (OPCODE)OP_OR;
+    logop->op_ppaddr = PL_ppaddr[OP_OR];
+    logop->op_first = evalop;
+    logop->op_flags = (U8)(0 | OPf_KIDS);
+    logop->op_other = LINKLIST(rest);
+    logop->op_private = (U8)(1 | (0 >> 8));
+
+    /* establish postfix order */
+    logop->op_next = LINKLIST(evalop);
+    evalop->op_next = (OP*)logop;
+    evalop->op_sibling = rest;
+
+    OP * or_op = newUNOP(OP_NULL, 0, (OP*)logop);
+    rest->op_next = or_op;
+   
+    OP *orop = cUNOPx(or_op)->op_first;
+    orop->op_type   = OP_CUSTOM;
+    orop->op_ppaddr = S_pp_catch;
+    
+    OP *o = op_prepend_elem(OP_LINESEQ, newOP(OP_ENTER, 0), or_op);
+    o->op_type = OP_LEAVE;
+    o->op_ppaddr = PL_ppaddr[OP_LEAVE];
+    cUNOPx(o)->op_first->op_type   = OP_CUSTOM;
+    cUNOPx(o)->op_first->op_ppaddr = S_pp_tryscope;
+    return o;
 }
 
 
@@ -140,15 +154,18 @@ S_parse_catch(pTHX_ GV* namegv, SV* psobj, U32* flagsp) {
     PERL_UNUSED_ARG(psobj);
  
     blockop = parse_block(0);
-   
+
     if (!blockop)
        croak("Couldn't parse the try {} block");
 
-    condop = newCONDOP(0, newOP(OP_NULL, 0), newOP(OP_NULL, 0), blockop);
+    /* XXX handle finally here */
+    return newUNOP(OP_NULL, OPf_SPECIAL, op_scope(blockop));
+
+/*
+    condop = newCONDOP(0, newOP(OP_NULL, 0), newOP(OP_NULL, 0), do_op);
     cUNOPx(condop)->op_first->op_type   = OP_CUSTOM;
     cUNOPx(condop)->op_first->op_ppaddr = S_pp_catch;
 
-    /* XXX ffs broken */
     rest = parse_args_list(flagsp);
     if (rest) {
         if ( rest->op_type != OP_LIST )
@@ -163,6 +180,7 @@ S_parse_catch(pTHX_ GV* namegv, SV* psobj, U32* flagsp) {
     }
 
     return rest;
+*/
 }
 
 #ifdef XopENTRY_set
@@ -175,13 +193,11 @@ PROTOTYPES: ENABLE
 
 void
 try(block, ...)
-PROTOTYPE: &;@
 PPCODE:
     croak("Don't do that.");
 
 void
 catch(block, ...)
-PROTOTYPE: &;@
 PPCODE:
     croak("Don't do that.");
 
