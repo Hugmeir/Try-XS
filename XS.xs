@@ -36,19 +36,48 @@ STATIC OP* remove_sub_call(pTHX_ OP* entersubop) {
    return realop;
 }
 
+#define MY_SAVESV(gv)   STMT_START { \
+    SV *tmp = newSVsv(GvSV(gv)); \
+    save_gp(gv, 0);   \
+    GvINTRO_off(gv);  \
+    SAVEGENERICSV(GvSV(gv)); \
+    GvSV(gv) = tmp;\
+} STMT_END
+
 STATIC OP*
 S_pp_catch(pTHX)
 {
     dVAR;
-    sv_setsv(GvSVn(PL_defgv), GvSVn(PL_errgv));
-    return cLOGOP->op_other;
+    /* First, save the exception in tmp */
+    SV *tmp = newSVsv(GvSVn(PL_errgv));
+    FREETMPS;
+    LEAVE;
+    
+    /* Run the OP_ENTER for the catch {} */
+    OP *next = PL_op = cLOGOP->op_other;
+    PL_op = next = next->op_ppaddr(aTHX);
+    
+    /* Now that we're in here, replace $_ and @_ */
+    MY_SAVESV(PL_defgv);
+    SAVEGENERICSV(GvAV(PL_defgv));
+    GvAV(PL_defgv) = NULL;
+    sv_setsv(GvSVn(PL_defgv), tmp);
+    
+    av_push(GvAVn(PL_defgv), tmp);
+    
+    return next;
 }
 
 STATIC OP*
 S_pp_entertry(pTHX)
 {
+    /* Preserve the original $@ inside the try {} */
+    SV * tmp = newSVsv(GvSVn(PL_errgv));
     OP * op = PL_ppaddr[OP_ENTERTRY](aTHX);
-    PL_op = op;
+
+    sv_setsv(GvSVn(PL_errgv), tmp);
+
+    PL_op = op = op->op_ppaddr(aTHX);
     while ((PL_op = op = op->op_ppaddr(aTHX))) {
         if (op->op_ppaddr == S_pp_catch) {
             op = cLOGOP->op_next;
@@ -58,14 +87,17 @@ S_pp_entertry(pTHX)
     return op;
 }
 
+/* The try { ... } ... is wrapped in an implicit
+ * do {} block, which we use to protect $@ from
+ * being overwritten
+ * So basially, this is our do { local $@ = $@; ... }
+ */
 STATIC OP*
 S_pp_tryscope(pTHX)
 {
     OP *next = PL_ppaddr[OP_ENTER](aTHX);
-    save_gp(PL_errgv, 0);
-    GvINTRO_off(PL_errgv);
-    SAVEGENERICSV(GvSV(PL_errgv));
-    GvSV(PL_errgv) = NULL;
+    /* Protect $@, but maintain its original value */
+    MY_SAVESV(PL_errgv);
     return next;
 }
 
@@ -73,36 +105,92 @@ static OP *
 S_ck_try(pTHX_ OP *entersubop, GV *namegv, SV *cv)
 {
     OP * leavetry = remove_sub_call(entersubop);
-      
+    
     PERL_UNUSED_ARG(namegv);
     PERL_UNUSED_ARG(cv);      
       
     return leavetry;
 }
 
+#ifndef qerror
+# define qerror(m) Perl_qerror(aTHX_ m)
+#endif /* !qerror */
+
 STATIC OP*
 S_parse_try(pTHX_ GV* namegv, SV* psobj, U32* flagsp) {
     OP* evalop;
     OP* blockop;
-    OP* rest;
- 
+    OP* rest = NULL;
+    I32 c = lex_peek_unichar(LEX_KEEP_PREVIOUS);
+    
     PERL_UNUSED_ARG(namegv);
     PERL_UNUSED_ARG(psobj);
  
+    lex_read_space(0);
+    c = lex_peek_unichar(LEX_KEEP_PREVIOUS);
+    
+    if ( c == '(' ) {
+        croak("syntax error, are you trying to call try {...} as try({...})?");
+    }
+    
     blockop = parse_block(0);
    
     if (!blockop)
        croak("Couldn't parse the try {} block");
-   
+
     evalop = newUNOP(OP_ENTERTRY, 0, blockop);
+    
     OP *entertry = cUNOPx(evalop)->op_first;
    
     entertry->op_type   = OP_CUSTOM;
     entertry->op_ppaddr = S_pp_entertry;
 
-    rest = parse_args_list(flagsp);
-   
-   LOGOP *logop;
+    /* Do we have any more arguments? */
+    lex_read_space(0);
+    c = lex_peek_unichar(LEX_KEEP_PREVIOUS);
+    
+    
+    if ( c == 'c' || c == 'f' ) {
+        char * bufend = PL_parser->bufend;
+        char * bufptr = PL_parser->bufptr;
+    
+        if ( (bufend - bufptr) < 7 ) {
+            lex_next_chunk(LEX_KEEP_PREVIOUS);
+            bufend = PL_parser->bufend;
+            bufptr = PL_parser->bufptr;
+        }
+        
+        if (memEQ(bufptr, "catch", 5)
+            && (!*(bufptr + 5)
+                || isSPACE(*(bufptr+5))
+                || *(bufptr + 5) == '{'
+               )
+            )
+        {
+            OP * catchblock;
+            I32 i = 0;
+            while (i++ < 5) {
+                lex_read_unichar(LEX_KEEP_PREVIOUS);
+            }
+            
+            lex_read_space(0);
+            
+            catchblock = parse_block(0);
+            rest = newUNOP(OP_NULL, OPf_SPECIAL, op_scope(catchblock));
+        }
+        
+    }
+    
+    if (!rest) {
+        OP *o = op_prepend_elem(OP_LINESEQ, newOP(OP_ENTER, 0), evalop);
+        o->op_type = OP_LEAVE;
+        o->op_ppaddr = PL_ppaddr[OP_LEAVE];
+        cUNOPx(o)->op_first->op_type   = OP_CUSTOM;
+        cUNOPx(o)->op_first->op_ppaddr = S_pp_tryscope;
+        return o;
+    }
+    
+    LOGOP *logop;
     NewOp(1101, logop, 1, LOGOP);
 
     logop->op_type = (OPCODE)OP_OR;
@@ -134,53 +222,14 @@ S_parse_try(pTHX_ GV* namegv, SV* psobj, U32* flagsp) {
 
 
 static OP *
-S_ck_catch(pTHX_ OP *entersubop, GV *namegv, SV *cv)
+S_ck_bad(pTHX_ OP *entersubop, GV *namegv, SV *sv)
 {
-    OP * catch = remove_sub_call(entersubop);
-
-    PERL_UNUSED_ARG(namegv);
-    PERL_UNUSED_ARG(cv);
-
-    return catch;
-}
-
-STATIC OP*
-S_parse_catch(pTHX_ GV* namegv, SV* psobj, U32* flagsp) {
-    OP* condop;
-    OP* blockop;
-    OP* rest;
- 
-    PERL_UNUSED_ARG(namegv);
-    PERL_UNUSED_ARG(psobj);
- 
-    blockop = parse_block(0);
-
-    if (!blockop)
-       croak("Couldn't parse the try {} block");
-
-    /* XXX handle finally here */
-    return newUNOP(OP_NULL, OPf_SPECIAL, op_scope(blockop));
-
-/*
-    condop = newCONDOP(0, newOP(OP_NULL, 0), newOP(OP_NULL, 0), do_op);
-    cUNOPx(condop)->op_first->op_type   = OP_CUSTOM;
-    cUNOPx(condop)->op_first->op_ppaddr = S_pp_catch;
-
-    rest = parse_args_list(flagsp);
-    if (rest) {
-        if ( rest->op_type != OP_LIST )
-            rest = newLISTOP(OP_LIST, 0, rest, NULL);
-        OP* p = cUNOPx(rest)->op_first;
+    PERL_UNUSED_ARG(entersubop);
+    PERL_UNUSED_ARG(sv);
     
-        condop->op_sibling = p->op_sibling;
-        p->op_sibling = condop;
-    }
-    else {
-        rest = condop;
-    }
+    croak("Useless bare %s()", GvNAME(namegv));
 
-    return rest;
-*/
+    return entersubop;
 }
 
 #ifdef XopENTRY_set
@@ -193,11 +242,13 @@ PROTOTYPES: ENABLE
 
 void
 try(block, ...)
+PROTOTYPE: &;@
 PPCODE:
     croak("Don't do that.");
 
 void
-catch(block, ...)
+catch(...)
+PROTOTYPE: &;@
 PPCODE:
     croak("Don't do that.");
 
@@ -218,6 +269,6 @@ BOOT:
 #endif /* XopENTRY_set */
     cv_set_call_checker(try, S_ck_try, &PL_sv_undef);
     cv_set_call_parser(try, S_parse_try, &PL_sv_undef);
-    cv_set_call_checker(catch, S_ck_catch, &PL_sv_undef);
-    cv_set_call_parser(catch, S_parse_catch, &PL_sv_undef);
+
+    cv_set_call_checker(catch, S_ck_bad, &PL_sv_undef);
 }
