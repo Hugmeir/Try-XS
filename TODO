@@ -1,0 +1,9 @@
+try {
+    try { die } catch { die } finally {...} 
+}
+
+finally isn't run! BAD!
+
+S_ck_noret erroneously catches this:
+try {die} catch { sub { return 100 }->() }
+
