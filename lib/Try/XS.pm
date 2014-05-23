@@ -9,7 +9,8 @@ use Devel::CallParser;
 use Exporter;
 BEGIN {
     our @ISA    = 'Exporter';
-    our @EXPORT = qw/try catch/;
+    # catch and finally are just stubs that explode at compile time if called directly.
+    our @EXPORT = qw/try catch finally/;
 }
 
 =head1 NAME

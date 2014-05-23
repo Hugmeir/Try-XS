@@ -4,7 +4,13 @@
 #endif
 #include "EXTERN.h"
 #include "perl.h"
+
+#ifndef WIN32
+#define PERL_CORE
 #include "XSUB.h"
+#else
+#include "XSUB.h"
+#endif
 
 #if (PERL_REVISION == 5 && PERL_VERSION < 14)
 #include "callchecker0.h"
@@ -50,18 +56,18 @@ S_pp_catch(pTHX)
     dVAR;
     /* First, save the exception in tmp */
     SV *tmp = newSVsv(GvSVn(PL_errgv));
-    FREETMPS;
     LEAVE;
     
     /* Run the OP_ENTER for the catch {} */
     OP *next = PL_op = cLOGOP->op_other;
     PL_op = next = next->op_ppaddr(aTHX);
-    
-    /* Now that we're in here, replace $_ and @_ */
+
     MY_SAVESV(PL_defgv);
-    SAVEGENERICSV(GvAV(PL_defgv));
+
+    /* Now that we're in here, replace $_ and @_ */
+    sv_setsv(GvSV(PL_defgv), tmp);
+    
     GvAV(PL_defgv) = NULL;
-    sv_setsv(GvSVn(PL_defgv), tmp);
     
     av_push(GvAVn(PL_defgv), tmp);
     
@@ -72,12 +78,12 @@ STATIC OP*
 S_pp_entertry(pTHX)
 {
     /* Preserve the original $@ inside the try {} */
+    OP * op;
     SV * tmp = newSVsv(GvSVn(PL_errgv));
-    OP * op = PL_ppaddr[OP_ENTERTRY](aTHX);
+    PL_op = op = PL_ppaddr[OP_ENTERTRY](aTHX);
 
     sv_setsv(GvSVn(PL_errgv), tmp);
 
-    PL_op = op = op->op_ppaddr(aTHX);
     while ((PL_op = op = op->op_ppaddr(aTHX))) {
         if (op->op_ppaddr == S_pp_catch) {
             op = cLOGOP->op_next;
@@ -97,7 +103,9 @@ S_pp_tryscope(pTHX)
 {
     OP *next = PL_ppaddr[OP_ENTER](aTHX);
     /* Protect $@, but maintain its original value */
+    save_aptr(&GvAV(PL_defgv));
     MY_SAVESV(PL_errgv);
+    GvAV(PL_defgv) = NULL;
     return next;
 }
 
@@ -112,15 +120,32 @@ S_ck_try(pTHX_ OP *entersubop, GV *namegv, SV *cv)
     return leavetry;
 }
 
-#ifndef qerror
-# define qerror(m) Perl_qerror(aTHX_ m)
-#endif /* !qerror */
+#define peek_next_token(l, len) STMT_START {    \
+    c = lex_peek_unichar(LEX_KEEP_PREVIOUS);    \
+    if ( c == l ) {                             \
+        bufend = PL_parser->bufend;             \
+        bufptr = PL_parser->bufptr;             \
+        if ( (bufend - bufptr) < len ) {        \
+            lex_next_chunk(LEX_KEEP_PREVIOUS);  \
+            bufend = PL_parser->bufend;         \
+            bufptr = PL_parser->bufptr;         \
+        }                                       \
+    }                                           \
+} STMT_END
+
+STATIC OP*
+S_ck_noret(pTHX_ OP* o)
+{
+    warn("Dubious use of return() in catch/finally");
+    return o;
+}
 
 STATIC OP*
 S_parse_try(pTHX_ GV* namegv, SV* psobj, U32* flagsp) {
     OP* evalop;
     OP* blockop;
-    OP* rest = NULL;
+    OP* catch = NULL;
+    OP* finally = NULL;
     I32 c = lex_peek_unichar(LEX_KEEP_PREVIOUS);
     
     PERL_UNUSED_ARG(namegv);
@@ -149,39 +174,104 @@ S_parse_try(pTHX_ GV* namegv, SV* psobj, U32* flagsp) {
     lex_read_space(0);
     c = lex_peek_unichar(LEX_KEEP_PREVIOUS);
     
-    
-    if ( c == 'c' || c == 'f' ) {
-        char * bufend = PL_parser->bufend;
-        char * bufptr = PL_parser->bufptr;
-    
-        if ( (bufend - bufptr) < 7 ) {
-            lex_next_chunk(LEX_KEEP_PREVIOUS);
-            bufend = PL_parser->bufend;
-            bufptr = PL_parser->bufptr;
-        }
-        
-        if (memEQ(bufptr, "catch", 5)
-            && (!*(bufptr + 5)
-                || isSPACE(*(bufptr+5))
-                || *(bufptr + 5) == '{'
-               )
-            )
-        {
-            OP * catchblock;
-            I32 i = 0;
-            while (i++ < 5) {
-                lex_read_unichar(LEX_KEEP_PREVIOUS);
+    bool good = TRUE;
+    while ( (c == 'c' || c == 'f') && good ) {
+        char * bufend;
+        char * bufptr;
+
+        switch (c) {
+        case 'c': {
+            peek_next_token('c', 7);
+            if ( (bufend - bufptr) >= 5
+                && memEQ(bufptr, "catch", 5)
+                && (!*(bufptr + 5)
+                    || isSPACE(*(bufptr+5))
+                    || *(bufptr + 5) == '{'
+                   )
+                )
+            {
+                OP * catchblock;
+                
+                if ( catch ) {
+                    croak("A try { ... } may not be followed by multiple catch { ... } blocks");
+                }
+                
+                lex_read_to(PL_parser->bufptr+5);
+            
+                lex_read_space(0);
+            
+                OP *(*nxck_return)(pTHX_ OP *o) = PL_check[OP_RETURN]; 
+
+                PL_check[OP_RETURN] = S_ck_noret;
+                catchblock = parse_block(0);
+                PL_check[OP_RETURN] = nxck_return;
+
+                lex_read_space(0);
+
+                catch = op_prepend_elem(OP_LINESEQ, newOP(OP_ENTER, 0), catchblock);
+                catch->op_type = OP_LEAVE;
+                catch->op_ppaddr = PL_ppaddr[OP_LEAVE];
+                c = lex_peek_unichar(LEX_KEEP_PREVIOUS);
             }
-            
-            lex_read_space(0);
-            
-            catchblock = parse_block(0);
-            rest = newUNOP(OP_NULL, OPf_SPECIAL, op_scope(catchblock));
+            break;
         }
-        
+        case 'f': {
+        peek_next_token('f', 9);
+
+            while ( c == 'f'
+                && (bufend - bufptr) >= 7
+                && memEQ(bufptr, "finally", 7)
+                && (!*(bufptr + 7)
+                    || isSPACE(*(bufptr+7))
+                    || *(bufptr + 7) == '{'
+                   )
+                )
+            {
+                OP * finallyblock;
+                lex_read_to(PL_parser->bufptr+7);
+                lex_read_space(0);
+            
+                OP *(*nxck_return)(pTHX_ OP *o) = PL_check[OP_RETURN]; 
+
+                PL_check[OP_RETURN] = S_ck_noret;
+                finallyblock = parse_block(0);
+                PL_check[OP_RETURN] = nxck_return;
+
+                finallyblock = op_prepend_elem(OP_LINESEQ, newOP(OP_ENTER, 0), finallyblock);
+                finallyblock->op_type = OP_LEAVE;
+                finallyblock->op_ppaddr = PL_ppaddr[OP_LEAVE];
+            
+                if ( !finally ) {
+                    finally = newLISTOP(OP_LIST, 0, finallyblock, NULL);
+                }
+                else {
+                    op_append_elem(OP_LIST, finally, finallyblock);
+                }
+            
+                lex_read_space(0);
+                peek_next_token('f', 9);
+            }
+            break;
+        }
+        default:
+            good = FALSE;
+            break;
+        }
     }
-    
-    if (!rest) {
+
+    if ( finally ) {
+        finally = op_prepend_elem(OP_LINESEQ, newOP(OP_ENTER, 0), finally);
+        finally->op_type = OP_LEAVE;
+        finally->op_ppaddr = PL_ppaddr[OP_LEAVE];
+        op_contextualize(finally, G_VOID);
+    }
+
+    /* No catch */
+    if (!catch) {
+        /* Attach the finallies */
+        if (finally) {
+            evalop = op_append_elem(OP_LIST, evalop, finally);
+        }
         OP *o = op_prepend_elem(OP_LINESEQ, newOP(OP_ENTER, 0), evalop);
         o->op_type = OP_LEAVE;
         o->op_ppaddr = PL_ppaddr[OP_LEAVE];
@@ -197,26 +287,30 @@ S_parse_try(pTHX_ GV* namegv, SV* psobj, U32* flagsp) {
     logop->op_ppaddr = PL_ppaddr[OP_OR];
     logop->op_first = evalop;
     logop->op_flags = (U8)(0 | OPf_KIDS);
-    logop->op_other = LINKLIST(rest);
+    logop->op_other = LINKLIST(catch);
     logop->op_private = (U8)(1 | (0 >> 8));
 
     /* establish postfix order */
     logop->op_next = LINKLIST(evalop);
     evalop->op_next = (OP*)logop;
-    evalop->op_sibling = rest;
+    evalop->op_sibling = catch;
 
     OP * or_op = newUNOP(OP_NULL, 0, (OP*)logop);
-    rest->op_next = or_op;
+    catch->op_next = or_op;
    
     OP *orop = cUNOPx(or_op)->op_first;
     orop->op_type   = OP_CUSTOM;
     orop->op_ppaddr = S_pp_catch;
+    
+    /* Attach the finallies */
+    or_op = op_append_elem(OP_LIST, or_op, finally);
     
     OP *o = op_prepend_elem(OP_LINESEQ, newOP(OP_ENTER, 0), or_op);
     o->op_type = OP_LEAVE;
     o->op_ppaddr = PL_ppaddr[OP_LEAVE];
     cUNOPx(o)->op_first->op_type   = OP_CUSTOM;
     cUNOPx(o)->op_first->op_ppaddr = S_pp_tryscope;
+
     return o;
 }
 
@@ -227,7 +321,7 @@ S_ck_bad(pTHX_ OP *entersubop, GV *namegv, SV *sv)
     PERL_UNUSED_ARG(entersubop);
     PERL_UNUSED_ARG(sv);
     
-    croak("Useless bare %s()", GvNAME(namegv));
+    croak("Useless bare %s { ... }", GvNAME(namegv));
 
     return entersubop;
 }
@@ -244,19 +338,25 @@ void
 try(block, ...)
 PROTOTYPE: &;@
 PPCODE:
-    croak("Don't do that.");
+    croak("Attempting to call try() directly is not support");
 
 void
 catch(...)
 PROTOTYPE: &;@
 PPCODE:
-    croak("Don't do that.");
+    croak("Attempting to call catch() directly is not support");
 
+void
+finally(...)
+PROTOTYPE: &;@
+PPCODE:
+    croak("Attempting to call finally() directly is not support");
 
 BOOT:
 {
     CV * const try     = get_cvn_flags("Try::XS::try", 12, 0);
     CV * const catch   = get_cvn_flags("Try::XS::catch", 14, 0);
+    CV * const finally = get_cvn_flags("Try::XS::finally", 16, 0);
 #ifdef XopENTRY_set
     XopENTRY_set(&entertry_op, xop_name, "entertry");
     XopENTRY_set(&entertry_op, xop_desc, "entertry");
@@ -270,5 +370,6 @@ BOOT:
     cv_set_call_checker(try, S_ck_try, &PL_sv_undef);
     cv_set_call_parser(try, S_parse_try, &PL_sv_undef);
 
+    cv_set_call_checker(finally, S_ck_bad, &PL_sv_undef);
     cv_set_call_checker(catch, S_ck_bad, &PL_sv_undef);
 }
